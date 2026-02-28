@@ -1,18 +1,10 @@
 {
-  "WX_SPOT": 4428,
-  "WX_SUM": 3303,
-  "3_Weather": 4428,
-  "4_Weather": 3303,
-  "LHR_COUNT": 0,
-  "LHR_INDEX": 0,
-  "5_Flights": 0,
-  "6_Airport": 0,
-  "TIDE_SPOT": 1216,
-  "TIDE_SWING": 38,
-  "1_Tide": 1216,
-  "2_Tide": 38,
-  "LON_ETF": 5644,
-  "LON_FLY": 1112,
-  "7_ETF": 5644,
-  "8_Option": 1112
+  "LHR_COUNT": 4663,
+  "LHR_INDEX": 104,
+  "5_Flights": 4663,
+  "6_Airport": 104,
+  "WX_SPOT": 4351,
+  "WX_SUM": 3365,
+  "3_Weather": 4351,
+  "4_Weather": 3365
 }

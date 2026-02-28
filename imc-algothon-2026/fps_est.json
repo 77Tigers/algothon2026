@@ -1,0 +1,18 @@
+{
+  "LHR_COUNT": 4663,
+  "LHR_INDEX": 104,
+  "5_Flights": 4663,
+  "6_Airport": 104,
+  "WX_SPOT": 4351,
+  "WX_SUM": 3365,
+  "3_Weather": 4351,
+  "4_Weather": 3365,
+  "TIDE_SPOT": 1667,
+  "TIDE_SWING": 73,
+  "1_Tide": 1667,
+  "2_Tide": 73,
+  "LON_ETF": 10681,
+  "LON_FLY": 7362,
+  "7_ETF": 10681,
+  "8_Option": 7362
+}
