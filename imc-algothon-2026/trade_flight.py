@@ -35,7 +35,7 @@ def get_fair_flight_price() -> tuple[int, int]:
         if total > 0:
             metric += 100.0 * (arr - dep) / total
 
-    return round(lhr_count), round(metric)
+    return round(lhr_count), round(abs(metric))
 
 
 if __name__ == "__main__":

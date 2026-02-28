@@ -12,7 +12,7 @@ def fair_price() -> tuple[int, int]:
     if session.empty:
         raise RuntimeError("No London weather points in current session window")
 
-    session["temp_f"] = session["temperature_c"].map(c_to_f)
+    session["temp_f"] = session["temperature_c"].map(c_to_f).round()
     session["wx_prod"] = session["temp_f"] * session["humidity"]
 
     # Tutor formulas:
@@ -20,7 +20,7 @@ def fair_price() -> tuple[int, int]:
     # WX_SUM: sum(temp_F * humidity_%) over 15m points / 100.
     settle_idx = (weather["time"] - end).abs().idxmin()
     settle = weather.loc[settle_idx]
-    wx_spot = c_to_f(float(settle["temperature_c"])) * float(settle["humidity"])
+    wx_spot = round(c_to_f(float(settle["temperature_c"]))) * float(settle["humidity"])
     wx_sum = session["wx_prod"].sum() / 100.0
 
     return round(wx_spot), round(wx_sum)

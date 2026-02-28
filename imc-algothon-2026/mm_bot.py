@@ -90,26 +90,52 @@ def pricing_calculation(best_bid, best_bid_volume, best_ask, best_ask_volume,
     else:
         fair_value = microprice
 
-    inventory_risk = inventory_risk_calculation(
+    # Proportional reference: use half_spread scale for skew/risk bounds
+    ref = max(fair_value, 1.0)  # reference price for proportional calculations
+
+    inventory_risk_raw = inventory_risk_calculation(
         current_position, params["position_limit"], tick_size
-    ) * params["inventory_risk"]
+    )
+    # Scale inventory risk proportionally to fair value
+    inv_risk_pct = params.get("inventory_risk_pct", 0.003)  # default 0.3% max skew at full position
+    max_inv_skew = ref * inv_risk_pct
+    inventory_risk = inventory_risk_raw * max_inv_skew  # smooth_boost(0..1) * max_skew
+
     obi = orderbook_imbalance_calculation(
         best_bid_volume, best_ask_volume, tick_size
     ) * params["orderbook_imbalance"]
-    vol = volatility_calculation(
-        history_microprices, tick_size, params["window_size"]
-    ) * params["volatility"]
-    base_spread = params["base_spread"]
+    # Volatility: realized vol from mid price changes, scaled proportionally
+    vol_pct = params.get("volatility_pct", 0.0)
+    if vol_pct > 0 and len(history_microprices) >= 3:
+        prices = np.array(history_microprices[-21:], dtype=float)
+        prices = prices[prices > 0]
+        if len(prices) >= 3:
+            log_ret = np.diff(np.log(prices))
+            realized_vol = float(np.sqrt(np.mean(log_ret ** 2)))  # fraction of price
+            vol = realized_vol * vol_pct * ref  # extra half-spread in price units
+        else:
+            vol = 0.0
+    else:
+        vol = 0.0
+
+    # Dynamic base_spread: use percentage of fair_value if base_spread_pct is set
+    if "base_spread_pct" in params and fair_value > 0:
+        base_spread = max(tick_size, ref * params["base_spread_pct"])
+    else:
+        base_spread = params["base_spread"]
 
     # Half spread
-    base_spread = bound_impact(base_spread, 0, 3 * tick_size)
-    vol = bound_impact(vol, 0, 3 * tick_size)
+    max_half = max(5 * tick_size, ref * 0.01)  # cap at 1% of fair value
+    base_spread = bound_impact(base_spread, 0, max_half)
+    vol = bound_impact(vol, 0, max_half)
     half_spread = base_spread + vol
-    half_spread = bound_impact(half_spread, tick_size, 5 * tick_size)
+    half_spread = bound_impact(half_spread, tick_size, max_half)
 
-    # Skew
-    obi = bound_impact(obi, -2 * tick_size, 2 * tick_size)
-    inventory_risk = bound_impact(inventory_risk, 0, 3 * tick_size)
+    # Skew (proportional to fair value)
+    max_skew = max(3 * tick_size, ref * 0.005)  # cap at 0.5% of fair value
+    obi_scaled = obi * (ref / max(tick_size, 1))  # scale OBI from tick-space to price-space
+    obi_scaled = bound_impact(obi_scaled, -max_skew, max_skew)
+    inventory_risk = bound_impact(inventory_risk, 0, max_skew)
 
     if current_position > 0:
         inventory_risk = -inventory_risk  # skew towards selling
@@ -118,8 +144,8 @@ def pricing_calculation(best_bid, best_bid_volume, best_ask, best_ask_volume,
     else:
         inventory_risk = 0
 
-    skew = inventory_risk + obi
-    skew = bound_impact(skew, -3 * tick_size, 3 * tick_size)
+    skew = inventory_risk + obi_scaled
+    skew = bound_impact(skew, -max_skew, max_skew)
 
     ask_price = fair_value + half_spread + skew
     bid_price = fair_value - half_spread + skew
@@ -129,7 +155,7 @@ def pricing_calculation(best_bid, best_bid_volume, best_ask, best_ask_volume,
 
 def position_sizing_calculation(current_position, position_limit, max_post_volume,
                                 side="bid", outstanding_position=0):
-    """Calculate position size respecting limits."""
+    """Calculate position size respecting limits with soft/hard caps."""
     outstanding_position = max(0, outstanding_position)
 
     if side == "bid":
@@ -138,6 +164,21 @@ def position_sizing_calculation(current_position, position_limit, max_post_volum
         capacity = max(0, position_limit + current_position - outstanding_position)
 
     volume = max(0, min(max_post_volume, capacity))
+
+    # Soft limit: scale down volume when position > 70% of limit
+    abs_pos = abs(current_position)
+    soft_limit = position_limit * 0.7
+    hard_limit = position_limit * 0.9
+    adding_to_position = (side == "bid" and current_position > 0) or \
+                         (side == "ask" and current_position < 0)
+
+    if adding_to_position and abs_pos > soft_limit:
+        if abs_pos >= hard_limit:
+            # Hard stop: don't add to position beyond 90%
+            return 0
+        # Linear scale down between 70% and 90%
+        scale = (hard_limit - abs_pos) / (hard_limit - soft_limit)
+        volume = max(1, int(volume * scale))
 
     # Safety check
     if side == "bid":
@@ -312,36 +353,44 @@ class ProductState:
 
 CMI_MM_PARAMS = {
     "tick_size": 1,
-    "volatility": 0.3,
-    "orderbook_imbalance": 1.0,
-    "inventory_risk": 1.5,
-    "base_spread": 2,              # base half-spread in ticks
-    "max_post_volume": 20,         # conservative to start
+    "volatility_pct": 0.0,         # extra half-spread multiplier from realized vol (0=disabled)
+    "orderbook_imbalance": 0.0,
+    "inventory_risk_pct": 0.003,   # max inventory skew = 0.3% of fair value at full position
+    "base_spread": 2,              # fallback half-spread in ticks (used if no base_spread_pct)
+    "base_spread_pct": 0.002,     # default: 0.2% of fair value as half-spread
+    "max_post_volume": 5,         # conservative to start
     "position_limit": 100,
     "window_size": 20,
-    "fair_value_method": "microprice",
-    "fair_anchor_weight": 0.6,     # 60% fps.json, 40% microprice
+    "fair_value_method": "midprice",
+    "fair_anchor_weight": 0.8,     # 80% fps.json, 20% microprice
 }
 
 # Per-product param overrides (optional)
+# base_spread_pct = half-spread as fraction of fair value
 PRODUCT_PARAMS = {
-    "TIDE_SPOT":  {"base_spread": 3, "max_post_volume": 15},
-    "TIDE_SWING": {"base_spread": 4, "max_post_volume": 15},
-    "WX_SPOT":    {"base_spread": 3, "max_post_volume": 15},
-    "WX_SUM":     {"base_spread": 3, "max_post_volume": 15},
-    "LHR_COUNT":  {"base_spread": 3, "max_post_volume": 15},
-    "LHR_INDEX":  {"base_spread": 3, "max_post_volume": 15},
-    "LON_ETF":    {"base_spread": 4, "max_post_volume": 10},
-    "LON_FLY":    {"base_spread": 5, "max_post_volume": 10},
+    # volatility_pct: how much realized vol widens spread (0=off). Higher for volatile products.
+    # TIDE_SPOT: level swings hundreds in session, high vol
+    # WX: temp/humidity change slowly, low vol
+    # LHR_COUNT: monotonic accumulation, medium vol
+    # LON_ETF/FLY: composite, highest vol
+    # fair_anchor_weight: WX=high (stable API), Flight=medium (API delay), Tide=lower (extrapolation), ETF/FLY=derived
+    "TIDE_SPOT":  {"base_spread_pct": 0.002, "inventory_risk_pct": 0.003, "volatility_pct": 0.5, "fair_anchor_weight": 0.6, "max_post_volume": 15},
+    "TIDE_SWING": {"base_spread_pct": 0.005, "inventory_risk_pct": 0.005, "volatility_pct": 0.8, "fair_anchor_weight": 0.5, "max_post_volume": 15},
+    "WX_SPOT":    {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.2, "fair_anchor_weight": 0.9, "max_post_volume": 15},
+    "WX_SUM":     {"base_spread_pct": 0.002, "inventory_risk_pct": 0.002, "volatility_pct": 0.2, "fair_anchor_weight": 0.9, "max_post_volume": 15},
+    "LHR_COUNT":  {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.3, "fair_anchor_weight": 0.8, "max_post_volume": 15},
+    "LHR_INDEX":  {"base_spread_pct": 0.015, "inventory_risk_pct": 0.01, "volatility_pct": 0.5, "fair_anchor_weight": 0.75, "max_post_volume": 15},
+    "LON_ETF":    {"base_spread_pct": 0.001, "inventory_risk_pct": 0.002, "volatility_pct": 0.5, "fair_anchor_weight": 0.75, "max_post_volume": 10},
+    "LON_FLY":    {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.8, "fair_anchor_weight": 0.7, "max_post_volume": 10},
     # Also support numbered symbols
-    "1_Tide":     {"base_spread": 3, "max_post_volume": 15},
-    "2_Tide":     {"base_spread": 4, "max_post_volume": 15},
-    "3_Weather":  {"base_spread": 3, "max_post_volume": 15},
-    "4_Weather":  {"base_spread": 3, "max_post_volume": 15},
-    "5_Flights":  {"base_spread": 3, "max_post_volume": 15},
-    "6_Airport":  {"base_spread": 3, "max_post_volume": 15},
-    "7_ETF":      {"base_spread": 4, "max_post_volume": 10},
-    "8_Option":   {"base_spread": 5, "max_post_volume": 10},
+    "1_Tide":     {"base_spread_pct": 0.002, "inventory_risk_pct": 0.003, "volatility_pct": 0.5, "fair_anchor_weight": 0.6, "max_post_volume": 15},
+    "2_Tide":     {"base_spread_pct": 0.005, "inventory_risk_pct": 0.005, "volatility_pct": 0.8, "fair_anchor_weight": 0.5, "max_post_volume": 15},
+    "3_Weather":  {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.2, "fair_anchor_weight": 0.9, "max_post_volume": 15},
+    "4_Weather":  {"base_spread_pct": 0.002, "inventory_risk_pct": 0.002, "volatility_pct": 0.2, "fair_anchor_weight": 0.9, "max_post_volume": 15},
+    "5_Flights":  {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.3, "fair_anchor_weight": 0.8, "max_post_volume": 15},
+    "6_Airport":  {"base_spread_pct": 0.015, "inventory_risk_pct": 0.01, "volatility_pct": 0.5, "fair_anchor_weight": 0.75, "max_post_volume": 15},
+    "7_ETF":      {"base_spread_pct": 0.001, "inventory_risk_pct": 0.002, "volatility_pct": 0.5, "fair_anchor_weight": 0.75, "max_post_volume": 10},
+    "8_Option":   {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.8, "fair_anchor_weight": 0.7, "max_post_volume": 10},
 }
 
 SYMBOL_ALIASES = {
@@ -398,13 +447,16 @@ class MMBot(BaseBot):
 
     # -- Rate-limited request wrapper --
 
-    def _throttle(self):
-        """Ensure at least 1 second between API requests."""
+    def _throttle(self, min_gap: float = 0.2):
+        """Soft rate limit between API requests.
+        BaseBot.send_orders() is parallel, so exchange tolerates bursts.
+        We use a short gap to avoid hammering while staying responsive.
+        """
         with self._request_lock:
             now = time.time()
             elapsed = now - self._last_request_time
-            if elapsed < 1.0:
-                time.sleep(1.0 - elapsed)
+            if elapsed < min_gap:
+                time.sleep(min_gap - elapsed)
             self._last_request_time = time.time()
 
     # -- Data loading --
@@ -506,25 +558,27 @@ class MMBot(BaseBot):
         if not order_id:
             return
         try:
-            self._throttle()
             self.cancel_order(order_id)
         except Exception as e:
             self.log(f"Cancel error {order_id[:8]}: {e}")
 
-    def _place_order(self, product: str, price: float, volume: int, side: Side) -> str | None:
-        """Place an order and return its ID."""
-        price = int(round(price))  # CMI requires integer prices
-        if price <= 0 or volume <= 0:
-            return None
-        try:
-            self._throttle()
-            order = OrderRequest(product=product, price=price, volume=volume, side=side)
-            resp = self.send_order(order)
-            if resp:
-                return resp.id
-        except Exception as e:
-            self.log(f"Place order error {product} {side} {volume}@{price}: {e}")
-        return None
+    def _cancel_orders_batch(self, order_ids: list[str]):
+        """Cancel multiple orders in parallel (like BaseBot.cancel_all_orders)."""
+        ids = [oid for oid in order_ids if oid]
+        if not ids:
+            return
+        from threading import Thread
+        threads = [Thread(target=self._cancel_order_safe, args=(oid,)) for oid in ids]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+    def _place_orders_batch(self, orders: list[OrderRequest]) -> list:
+        """Place multiple orders in parallel using BaseBot.send_orders."""
+        if not orders:
+            return []
+        return self.send_orders(orders)
 
     # -- Core MM execution for one product --
 
@@ -608,36 +662,53 @@ class MMBot(BaseBot):
         if our_ask_id and not need_cancel_ask and our_ask_price == mm_ask_price:
             need_place_ask = False
 
-        # Cancel stale orders
+        # Cancel stale orders (batch, parallel)
+        cancel_ids = []
         if need_cancel_bid:
-            self._cancel_order_safe(our_bid_id)
+            cancel_ids.append(our_bid_id)
             state.our_bid_id = None
-
         if need_cancel_ask:
-            self._cancel_order_safe(our_ask_id)
+            cancel_ids.append(our_ask_id)
             state.our_ask_id = None
+        if cancel_ids:
+            self._cancel_orders_batch(cancel_ids)
 
-        # Place new orders
+        # Place new orders (batch, parallel)
+        new_orders = []
+        bid_idx, ask_idx = -1, -1
         if need_place_bid:
-            # Safety: check position limit
             if current_position + mm_bid_vol <= params["position_limit"]:
-                new_id = self._place_order(product, mm_bid_price, mm_bid_vol, Side.BUY)
-                if new_id:
-                    state.our_bid_id = new_id
-                    state.our_bid_price = mm_bid_price
-                    state.our_bid_volume = mm_bid_vol
+                bid_idx = len(new_orders)
+                new_orders.append(OrderRequest(
+                    product=product, price=int(round(mm_bid_price)),
+                    volume=mm_bid_vol, side=Side.BUY
+                ))
             else:
                 self.log(f"{product}: BID blocked, pos={current_position}+{mm_bid_vol} > limit")
 
         if need_place_ask:
             if current_position - mm_ask_vol >= -params["position_limit"]:
-                new_id = self._place_order(product, mm_ask_price, mm_ask_vol, Side.SELL)
-                if new_id:
-                    state.our_ask_id = new_id
-                    state.our_ask_price = mm_ask_price
-                    state.our_ask_volume = mm_ask_vol
+                ask_idx = len(new_orders)
+                new_orders.append(OrderRequest(
+                    product=product, price=int(round(mm_ask_price)),
+                    volume=mm_ask_vol, side=Side.SELL
+                ))
             else:
                 self.log(f"{product}: ASK blocked, pos={current_position}-{mm_ask_vol} < -limit")
+
+        if new_orders:
+            self._throttle()
+            results = self._place_orders_batch(new_orders)
+            # Map results back to state
+            for i, resp in enumerate(results):
+                if i == bid_idx:
+                    state.our_bid_id = resp.id
+                    state.our_bid_price = mm_bid_price
+                    state.our_bid_volume = mm_bid_vol
+                elif i == ask_idx:
+                    state.our_ask_id = resp.id
+                    state.our_ask_price = mm_ask_price
+                    state.our_ask_volume = mm_ask_vol
 
         state.last_quote_time = time.time()
 
@@ -729,6 +800,8 @@ if __name__ == "__main__":
     bot.log("Starting MM Bot...")
     bot.start()           # SSE stream for reactive MM
     bot.start_polling()   # Background polling for ALL products
+    # First poll cycle will: discover products → fetch orderbooks →
+    # load existing orders into state → only cancel orders with wrong prices
     bot.log("MM Bot started: SSE + polling active for all products")
 
     try:

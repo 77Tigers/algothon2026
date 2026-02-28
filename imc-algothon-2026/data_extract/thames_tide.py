@@ -83,13 +83,18 @@ def get_thames_fair_price(
     if session_realized.empty:
         raise RuntimeError("No Thames readings in current session window")
 
-    # TIDE_SPOT anchor rule:
-    # - Before settlement: use level closest to session start (Saturday 12:00 London).
-    # - After settlement: use level closest to settlement time (Sunday 12:00 London).
-    spot_anchor = start if now < end else end
-    spot_idx = (df["time"] - spot_anchor).abs().idxmin()
+    # TIDE_SPOT: absolute value of water level at settlement time (in mm).
+    # - After settlement: use level closest to settlement time.
+    # - Before settlement: use most recent reading as best estimate.
+    #   (Session start level is stale and causes large fair value gaps.)
+    if now >= end:
+        spot_anchor = end
+        spot_idx = (df["time"] - spot_anchor).abs().idxmin()
+        spot_source = "settlement_12"
+    else:
+        spot_idx = (df["time"] - now).abs().idxmin()
+        spot_source = "latest_reading"
     spot_level_m = float(df.loc[spot_idx, "level"])
-    spot_source = "session_start_12" if now < end else "settlement_12"
     tide_spot = abs(spot_level_m) * 1000.0
 
     # TIDE_SWING: realized part + extrapolated remainder (optional).
