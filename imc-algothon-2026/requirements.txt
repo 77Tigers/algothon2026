@@ -1,0 +1,9 @@
+bs4
+requests
+beautifulsoup4 
+lxml 
+pandas 
+json5
+sseclient
+
+ git+https://github.com/m0rp43us/openmeteopy
