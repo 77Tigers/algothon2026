@@ -2,7 +2,7 @@
 """
 从 timeanddate past weather HTML 中提取 #wt-his 表格里的每半小时观测（原样，不对齐）。
 用法:
-    python past24h_raw_30min_fix.py munich.html
+    python past24h_raw_30min_fix.py london.html
 
 输出:
     past24h_raw_30min.csv
