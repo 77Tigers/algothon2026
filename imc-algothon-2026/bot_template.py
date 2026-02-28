@@ -140,9 +140,15 @@ class _SSEThread(Thread):
     def close(self):
         self._closed = True
         if self._http_stream:
-            self._http_stream.close()
+            try:
+                self._http_stream.close()
+            except Exception:
+                pass
         if self._client:
-            self._client.close()
+            try:
+                self._client.close()
+            except (AttributeError, Exception):
+                pass
 
     def _consume(self):
         headers = {
