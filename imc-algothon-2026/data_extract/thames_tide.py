@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
@@ -76,7 +76,7 @@ def get_thames_fair_price(
 ) -> tuple[int, int]:
     start, end = settlement_session_bounds()
     now = datetime.now(LONDON_TZ)
-    df = get_thames()
+    df = get_thames(limit=500)  # ~5 days of 15-min readings
     session_full = df[(df["time"] >= start) & (df["time"] < end)].copy()
     realized_end = min(now, end)
     session_realized = df[(df["time"] >= start) & (df["time"] < realized_end)].copy()
@@ -84,18 +84,33 @@ def get_thames_fair_price(
         raise RuntimeError("No Thames readings in current session window")
 
     # TIDE_SPOT: absolute value of water level at settlement time (in mm).
-    # - After settlement: use level closest to settlement time.
-    # - Before settlement: use most recent reading as best estimate.
-    #   (Session start level is stale and causes large fair value gaps.)
+    # After settlement: use actual reading at settlement time.
+    # Before settlement: average of previous days' 12:00 readings as predictor.
     if now >= end:
-        spot_anchor = end
-        spot_idx = (df["time"] - spot_anchor).abs().idxmin()
+        spot_idx = (df["time"] - end).abs().idxmin()
+        spot_level_m = float(df.loc[spot_idx, "level"])
         spot_source = "settlement_12"
     else:
-        spot_idx = (df["time"] - now).abs().idxmin()
-        spot_source = "latest_reading"
-    spot_level_m = float(df.loc[spot_idx, "level"])
+        # Find all readings closest to 12:00 on previous days
+        # Take abs() of EACH level first — settlement = abs(level), and
+        # E[|X|] != |E[X]| when levels alternate sign (tidal oscillation).
+        noon_abs_levels = []
+        for day_offset in range(1, 6):  # look back 1-5 days
+            target_noon = end - timedelta(days=day_offset)
+            candidates = df[(df["time"] - target_noon).abs() < timedelta(minutes=15)]
+            if not candidates.empty:
+                idx = (candidates["time"] - target_noon).abs().idxmin()
+                noon_abs_levels.append(abs(float(candidates.loc[idx, "level"])))
+        if noon_abs_levels:
+            spot_level_m = sum(noon_abs_levels) / len(noon_abs_levels)
+            spot_source = f"avg_abs_noon_{len(noon_abs_levels)}d"
+        else:
+            # Fallback: latest reading
+            spot_idx = (df["time"] - now).abs().idxmin()
+            spot_level_m = float(df.loc[spot_idx, "level"])
+            spot_source = "latest_fallback"
     tide_spot = abs(spot_level_m) * 1000.0
+    print(f"[Tide] TIDE_SPOT={tide_spot:.0f}mm source={spot_source}")
 
     # TIDE_SWING: realized part + extrapolated remainder (optional).
     realized_diffs_cm = session_realized["level"].diff().abs().dropna() * 100.0

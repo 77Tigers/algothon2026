@@ -98,7 +98,7 @@ def pricing_calculation(best_bid, best_bid_volume, best_ask, best_ask_volume,
     )
     # Scale inventory risk proportionally to fair value
     inv_risk_pct = params.get("inventory_risk_pct", 0.003)  # default 0.3% max skew at full position
-    max_inv_skew = ref * inv_risk_pct
+    max_inv_skew = max(tick_size, ref * inv_risk_pct)  # floor: at least 1 tick skew at full pos
     inventory_risk = inventory_risk_raw * max_inv_skew  # smooth_boost(0..1) * max_skew
 
     obi = orderbook_imbalance_calculation(
@@ -120,9 +120,9 @@ def pricing_calculation(best_bid, best_bid_volume, best_ask, best_ask_volume,
 
     # Dynamic base_spread: use percentage of fair_value if base_spread_pct is set
     if "base_spread_pct" in params and fair_value > 0:
-        base_spread = max(tick_size, ref * params["base_spread_pct"])
+        base_spread = max(2 * tick_size, ref * params["base_spread_pct"])  # floor: 2 ticks
     else:
-        base_spread = params["base_spread"]
+        base_spread = max(2 * tick_size, params["base_spread"])
 
     # Half spread
     max_half = max(5 * tick_size, ref * 0.01)  # cap at 1% of fair value
@@ -165,10 +165,10 @@ def position_sizing_calculation(current_position, position_limit, max_post_volum
 
     volume = max(0, min(max_post_volume, capacity))
 
-    # Soft limit: scale down volume when position > 70% of limit
+    # Soft limit: scale down volume early to prevent large accumulation
     abs_pos = abs(current_position)
-    soft_limit = position_limit * 0.7
-    hard_limit = position_limit * 0.9
+    soft_limit = position_limit * 0.4
+    hard_limit = position_limit * 0.7
     adding_to_position = (side == "bid" and current_position > 0) or \
                          (side == "ask" and current_position < 0)
 
@@ -374,23 +374,23 @@ PRODUCT_PARAMS = {
     # LHR_COUNT: monotonic accumulation, medium vol
     # LON_ETF/FLY: composite, highest vol
     # fair_anchor_weight: WX=high (stable API), Flight=medium (API delay), Tide=lower (extrapolation), ETF/FLY=derived
-    "TIDE_SPOT":  {"base_spread_pct": 0.002, "inventory_risk_pct": 0.003, "volatility_pct": 0.5, "fair_anchor_weight": 0.6, "max_post_volume": 15},
-    "TIDE_SWING": {"base_spread_pct": 0.005, "inventory_risk_pct": 0.005, "volatility_pct": 0.8, "fair_anchor_weight": 0.5, "max_post_volume": 15},
-    "WX_SPOT":    {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.2, "fair_anchor_weight": 0.9, "max_post_volume": 15},
-    "WX_SUM":     {"base_spread_pct": 0.002, "inventory_risk_pct": 0.002, "volatility_pct": 0.2, "fair_anchor_weight": 0.9, "max_post_volume": 15},
-    "LHR_COUNT":  {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.3, "fair_anchor_weight": 0.8, "max_post_volume": 15},
-    "LHR_INDEX":  {"base_spread_pct": 0.015, "inventory_risk_pct": 0.01, "volatility_pct": 0.5, "fair_anchor_weight": 0.75, "max_post_volume": 15},
-    "LON_ETF":    {"base_spread_pct": 0.001, "inventory_risk_pct": 0.002, "volatility_pct": 0.5, "fair_anchor_weight": 0.75, "max_post_volume": 10},
-    "LON_FLY":    {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.8, "fair_anchor_weight": 0.7, "max_post_volume": 10},
+    "TIDE_SPOT":  {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.5, "fair_anchor_weight": 0.3, "max_post_volume": 10},
+    "TIDE_SWING": {"base_spread_pct": 0.01, "inventory_risk_pct": 0.015, "volatility_pct": 0.8, "fair_anchor_weight": 0.3, "max_post_volume": 8},
+    "WX_SPOT":    {"base_spread_pct": 0.005, "inventory_risk_pct": 0.008, "volatility_pct": 0.2, "fair_anchor_weight": 0.0, "max_post_volume": 10},
+    "WX_SUM":     {"base_spread_pct": 0.005, "inventory_risk_pct": 0.008, "volatility_pct": 0.2, "fair_anchor_weight": 0.0, "max_post_volume": 10},
+    "LHR_COUNT":  {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.3, "fair_anchor_weight": 0.3, "max_post_volume": 10},
+    "LHR_INDEX":  {"base_spread_pct": 0.03, "inventory_risk_pct": 0.03, "volatility_pct": 0.5, "fair_anchor_weight": 0.3, "max_post_volume": 8},
+    "LON_ETF":    {"base_spread_pct": 0.001, "inventory_risk_pct": 0.005, "volatility_pct": 0.5, "fair_anchor_weight": 0.1, "max_post_volume": 5},
+    "LON_FLY":    {"base_spread_pct": 0.005, "inventory_risk_pct": 0.005, "volatility_pct": 1.0, "fair_anchor_weight": 0.1, "max_post_volume": 3},
     # Also support numbered symbols
-    "1_Tide":     {"base_spread_pct": 0.002, "inventory_risk_pct": 0.003, "volatility_pct": 0.5, "fair_anchor_weight": 0.6, "max_post_volume": 15},
-    "2_Tide":     {"base_spread_pct": 0.005, "inventory_risk_pct": 0.005, "volatility_pct": 0.8, "fair_anchor_weight": 0.5, "max_post_volume": 15},
-    "3_Weather":  {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.2, "fair_anchor_weight": 0.9, "max_post_volume": 15},
-    "4_Weather":  {"base_spread_pct": 0.002, "inventory_risk_pct": 0.002, "volatility_pct": 0.2, "fair_anchor_weight": 0.9, "max_post_volume": 15},
-    "5_Flights":  {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.3, "fair_anchor_weight": 0.8, "max_post_volume": 15},
-    "6_Airport":  {"base_spread_pct": 0.015, "inventory_risk_pct": 0.01, "volatility_pct": 0.5, "fair_anchor_weight": 0.75, "max_post_volume": 15},
-    "7_ETF":      {"base_spread_pct": 0.001, "inventory_risk_pct": 0.002, "volatility_pct": 0.5, "fair_anchor_weight": 0.75, "max_post_volume": 10},
-    "8_Option":   {"base_spread_pct": 0.0015, "inventory_risk_pct": 0.002, "volatility_pct": 0.8, "fair_anchor_weight": 0.7, "max_post_volume": 10},
+    "1_Tide":     {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.5, "fair_anchor_weight": 0.3, "max_post_volume": 10},
+    "2_Tide":     {"base_spread_pct": 0.01, "inventory_risk_pct": 0.015, "volatility_pct": 0.8, "fair_anchor_weight": 0.3, "max_post_volume": 8},
+    "3_Weather":  {"base_spread_pct": 0.005, "inventory_risk_pct": 0.008, "volatility_pct": 0.2, "fair_anchor_weight": 0.0, "max_post_volume": 10},
+    "4_Weather":  {"base_spread_pct": 0.005, "inventory_risk_pct": 0.008, "volatility_pct": 0.2, "fair_anchor_weight": 0.0, "max_post_volume": 10},
+    "5_Flights":  {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.3, "fair_anchor_weight": 0.3, "max_post_volume": 10},
+    "6_Airport":  {"base_spread_pct": 0.03, "inventory_risk_pct": 0.03, "volatility_pct": 0.5, "fair_anchor_weight": 0.3, "max_post_volume": 8},
+    "7_ETF":      {"base_spread_pct": 0.001, "inventory_risk_pct": 0.005, "volatility_pct": 0.5, "fair_anchor_weight": 0.1, "max_post_volume": 5},
+    "8_Option":   {"base_spread_pct": 0.005, "inventory_risk_pct": 0.005, "volatility_pct": 1.0, "fair_anchor_weight": 0.1, "max_post_volume": 3},
 }
 
 SYMBOL_ALIASES = {
@@ -419,6 +419,9 @@ class MMBot(BaseBot):
     - fps.json fair value as anchor
     - SSE orderbook events drive the loop
     """
+
+    # Products to skip (no quoting). Use canonical or numbered names.
+    SKIP_PRODUCTS: set[str] = {"LON_FLY", "8_Option"}
 
     def __init__(self, cmi_url: str, username: str, password: str,
                  params: dict | None = None, quote_interval: float = 5.0,
@@ -740,6 +743,8 @@ class MMBot(BaseBot):
             for product in self._known_products:
                 if not self._poll_running:
                     break
+                if product in self.SKIP_PRODUCTS:
+                    continue
                 self._execute_mm_for_product(product)
             # Sleep until next poll round
             for _ in range(int(self.poll_interval)):
@@ -768,6 +773,8 @@ class MMBot(BaseBot):
 
     def on_orderbook(self, orderbook: OrderBook):
         """SSE orderbook event → run MM for this product."""
+        if orderbook.product in self.SKIP_PRODUCTS:
+            return
         try:
             self._execute_mm(orderbook)
         except Exception as e:
@@ -784,17 +791,27 @@ class MMBot(BaseBot):
 # ============================================================================
 
 TEST_EXCHANGE = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
-REAL_EXCHANGE = ""  # TODO
+REAL_EXCHANGE = "http://ec2-52-19-74-159.eu-west-1.compute.amazonaws.com/"  # TODO
 
 USERNAME = "test9"       # TODO: change
 PASSWORD = "1233211234567!"  # TODO: change
 
+USERNAME_REAL = "algothon_winners"
+PASSWORD_REAL = "wewillwin1"
+
 if __name__ == "__main__":
+    # bot = MMBot(
+    #     cmi_url=TEST_EXCHANGE,
+    #     username=USERNAME,
+    #     password=PASSWORD,
+    #     quote_interval=2.0,  # seconds between requotes per product
+    # )
+
     bot = MMBot(
-        cmi_url=TEST_EXCHANGE,
-        username=USERNAME,
-        password=PASSWORD,
-        quote_interval=5.0,  # seconds between requotes per product
+        cmi_url=REAL_EXCHANGE,
+        username=USERNAME_REAL,
+        password=PASSWORD_REAL,
+        quote_interval=0.5,  # seconds between requotes per product
     )
 
     bot.log("Starting MM Bot...")

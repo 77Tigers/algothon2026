@@ -1,12 +1,54 @@
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
+import math
 import os
 import time
+from datetime import datetime
 from time import sleep
 
+from scipy.stats import norm
+
 from data_extract.thames_tide import get_thames_fair_price
+from data_extract.session import LONDON_TZ, settlement_session_bounds
 from trade_flight import get_fair_flight_price
 from trade_weather import fair_price
+
+
+def expected_call(mu: float, sigma: float, strike: float) -> float:
+    """E[max(0, S-K)] where S ~ N(mu, sigma)."""
+    if sigma <= 0:
+        return max(0.0, mu - strike)
+    d = (mu - strike) / sigma
+    return (mu - strike) * norm.cdf(d) + sigma * norm.pdf(d)
+
+
+def expected_put(mu: float, sigma: float, strike: float) -> float:
+    """E[max(0, K-S)] where S ~ N(mu, sigma)."""
+    if sigma <= 0:
+        return max(0.0, strike - mu)
+    d = (strike - mu) / sigma
+    return (strike - mu) * norm.cdf(d) + sigma * norm.pdf(d)
+
+
+def calc_lon_fly(etf_mu: float, etf_sigma: float) -> float:
+    """LON_FLY = 2*Put(6200) + Call(6200) - 2*Call(6600) + 3*Call(7000)."""
+    return (
+        2 * expected_put(etf_mu, etf_sigma, 6200)
+        + expected_call(etf_mu, etf_sigma, 6200)
+        - 2 * expected_call(etf_mu, etf_sigma, 6600)
+        + 3 * expected_call(etf_mu, etf_sigma, 7000)
+    )
+
+
+def estimate_etf_sigma() -> float:
+    """Estimate ETF settlement uncertainty based on time remaining.
+    Decays with sqrt(time). sigma=0 at settlement."""
+    _, end = settlement_session_bounds()
+    now = datetime.now(LONDON_TZ)
+    hours_left = max(0, (end - now).total_seconds() / 3600)
+    time_frac = min(1.0, hours_left / 24.0)
+    return 400 * math.sqrt(time_frac)
+
 
 FLIGHT_REFRESH_SECONDS = int(os.getenv("FLIGHT_REFRESH_SECONDS", "1800"))
 FLIGHT_RETRY_AFTER_FAIL_SECONDS = int(os.getenv("FLIGHT_RETRY_AFTER_FAIL_SECONDS", "3600"))
@@ -37,11 +79,13 @@ if cached_flights is not None:
     print(f"Loaded cached flights from fps.json: LHR_COUNT={cached_flights[0]}, LHR_INDEX={cached_flights[1]}")
 
 
+# Keep last known good values across loop iterations (don't reset to 0 on failure)
+wx_spot, wx_sum = 0, 0
+tide_spot, tide_swing = 0, 0
+lhr_count, lhr_index = 0, 0
+
 while True:
     fp: dict[str, int | str] = {}
-    wx_spot, wx_sum = 0, 0
-    tide_spot, tide_swing = 0, 0
-    lhr_count, lhr_index = 0, 0
 
     now = time.time()
     should_refresh_flights = cached_flights is None or (now - last_flight_refresh) >= FLIGHT_REFRESH_SECONDS
@@ -130,17 +174,21 @@ while True:
         lhr_count, lhr_index = cached_flights if cached_flights is not None else (0, 0)
 
     lon_etf = tide_spot + wx_spot + lhr_count
-    # LON_FLY = 2*Put(6200) + Call(6200) - 2*Call(6600) + 3*Call(7000)
-    put_6200 = max(0, 6200 - lon_etf)
-    call_6200 = max(0, lon_etf - 6200)
-    call_6600 = max(0, lon_etf - 6600)
-    call_7000 = max(0, lon_etf - 7000)
-    lon_fly = 2 * put_6200 + call_6200 - 2 * call_6600 + 3 * call_7000
-
-    fp["LON_ETF"] = round(lon_etf)
-    fp["LON_FLY"] = round(lon_fly)
-    fp["7_ETF"] = round(lon_etf)
-    fp["8_Option"] = round(lon_fly)
-    print(f"Final done: LON_ETF={fp['LON_ETF']}, LON_FLY={fp['LON_FLY']}")
+    if tide_spot > 0 and wx_spot > 0 and lhr_count > 0:
+        etf_sigma = estimate_etf_sigma()
+        lon_fly = calc_lon_fly(lon_etf, etf_sigma)
+        lon_fly_intrinsic = (
+            2 * max(0, 6200 - lon_etf) + max(0, lon_etf - 6200)
+            - 2 * max(0, lon_etf - 6600) + 3 * max(0, lon_etf - 7000)
+        )
+        fp["LON_ETF"] = round(lon_etf)
+        fp["LON_FLY"] = round(lon_fly)
+        fp["7_ETF"] = round(lon_etf)
+        fp["8_Option"] = round(lon_fly)
+        print(f"LON_ETF={round(lon_etf)} (tide={tide_spot} wx={wx_spot} flights={lhr_count})")
+        print(f"LON_FLY: sigma={etf_sigma:.0f} intrinsic={lon_fly_intrinsic:.0f} expected={lon_fly:.0f}")
+    else:
+        print(f"Skipping ETF/FLY: components incomplete "
+              f"(tide={tide_spot}, wx={wx_spot}, flights={lhr_count})")
     write_fps(fp)
-    sleep(30)
+    sleep(10)
