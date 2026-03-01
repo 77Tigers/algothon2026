@@ -3,6 +3,7 @@ import json
 from trade_weather import fair_price
 from trade_flight import get_fair_flight_price
 import time
+from datetime import datetime
 
 TEST_EXCHANGE = "http://ec2-52-49-69-152.eu-west-1.compute.amazonaws.com/"
 REAL_EXCHANGE = "" # TODO
@@ -17,38 +18,56 @@ class CustomBot(BaseBot):
     def __init__(self, cmi_url, username, password):
         super().__init__(cmi_url, username, password)
         self.placed = False
-        self.LIMIT = 200
+        self.LIMIT = 100
+        self.AGGRESSIVE_TRIGGER = 70
+        self.AGGRESSIVE_MAX_VOL = 20
+        self.AGGRESSIVE_COOLDOWN_SECONDS = 2.0
         self.last = time.time()-30
+        self.last_aggressive = 0.0
         self.seen_products = set()
+        self.pending_exposure: dict[str, tuple[int, int]] = {}
+
+    def log(self, msg: str) -> None:
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[{ts}] {msg}")
     # Handler for own trades
     def on_trades(self, trades: list[dict]):
         for trade in trades:
-            print(f"{trade['volume']} @ {trade['price']}")
+            self.log(f"Trade: {trade['product']} {trade['volume']} @ {trade['price']}")
         
 
     def strategy_weather(self, my_positions, fps):
-        print("Start Strategy for Weather")
+        self.log("Start Strategy for Weather")
         s = 50
         key1 = self._pick_symbol(fps, "WX_SPOT", "3_Weather")
         key2 = self._pick_symbol(fps, "WX_SUM", "4_Weather")
+        if not key1 and not key2:
+            self.log("Weather skip: no matching symbols found in fps/orderbook")
         if key1:
-            self.order(key1, fps[key1], my_positions.get(key1, 0), s)
+            pb, ps = self.pending_exposure.get(key1, (0, 0))
+            self.order(key1, fps[key1], my_positions.get(key1, 0), s, pending_buy=pb, pending_sell=ps)
         if key2:
-            self.order(key2, fps[key2], my_positions.get(key2, 0), s)
-        print("End Strategy for Weather")
+            pb, ps = self.pending_exposure.get(key2, (0, 0))
+            self.order(key2, fps[key2], my_positions.get(key2, 0), s, pending_buy=pb, pending_sell=ps)
+        self.log("End Strategy for Weather")
         
     def strategy_flight(self, my_positions, fps):
-        print("Start Strategy for Flight")
+        self.log("Start Strategy for Flight")
         key1 = self._pick_symbol(fps, "LHR_COUNT", "5_Flights")
         key2 = self._pick_symbol(fps, "LHR_INDEX", "6_Airport")
+        if not key1 and not key2:
+            self.log("Flight skip: no matching symbols found in fps/orderbook")
         if key1:
-            self.order(key1, fps[key1], my_positions.get(key1, 0), 50)
+            pb, ps = self.pending_exposure.get(key1, (0, 0))
+            self.order(key1, fps[key1], my_positions.get(key1, 0), 50, pending_buy=pb, pending_sell=ps)
         if key2:
-            self.order(key2, fps[key2], my_positions.get(key2, 0), 200)
-        print("End Strategy for Flight")
+            pb, ps = self.pending_exposure.get(key2, (0, 0))
+            self.order(key2, fps[key2], my_positions.get(key2, 0), 200, pending_buy=pb, pending_sell=ps)
+        self.log("End Strategy for Flight")
 
     def strategy_tide_and_derived(self, my_positions, fps):
-        print("Start Strategy for Tide/Derived")
+        self.log("Start Strategy for Tide/Derived")
+        placed_any = False
         for keys, spread in [
             (("TIDE_SPOT", "1_Tide"), 50),
             (("TIDE_SWING", "2_Tide"), 80),
@@ -57,8 +76,12 @@ class CustomBot(BaseBot):
         ]:
             key = self._pick_symbol(fps, *keys)
             if key:
-                self.order(key, fps[key], my_positions.get(key, 0), spread)
-        print("End Strategy for Tide/Derived")
+                pb, ps = self.pending_exposure.get(key, (0, 0))
+                self.order(key, fps[key], my_positions.get(key, 0), spread, pending_buy=pb, pending_sell=ps)
+                placed_any = True
+        if not placed_any:
+            self.log("Tide/Derived skip: no matching symbols found in fps/orderbook")
+        self.log("End Strategy for Tide/Derived")
 
     def _pick_symbol(self, container, *candidates):
         # Prefer symbols observed from live orderbooks on this exchange.
@@ -70,54 +93,194 @@ class CustomBot(BaseBot):
                 return c
         return None
 
-    def order(self, product, fair_price, position, s, normal_vol=20):
-        if position > 0:
+    def _fair_for_product(self, product: str, fps: dict) -> int | None:
+        if product in fps:
+            value = fps.get(product)
+            return int(value) if isinstance(value, (int, float)) else None
+
+        alias = {
+            "1_Tide": "TIDE_SPOT",
+            "TIDE_SPOT": "1_Tide",
+            "2_Tide": "TIDE_SWING",
+            "TIDE_SWING": "2_Tide",
+            "3_Weather": "WX_SPOT",
+            "WX_SPOT": "3_Weather",
+            "4_Weather": "WX_SUM",
+            "WX_SUM": "4_Weather",
+            "5_Flights": "LHR_COUNT",
+            "LHR_COUNT": "5_Flights",
+            "6_Airport": "LHR_INDEX",
+            "LHR_INDEX": "6_Airport",
+            "7_ETF": "LON_ETF",
+            "LON_ETF": "7_ETF",
+            "8_Option": "LON_FLY",
+            "LON_FLY": "8_Option",
+        }
+        alt = alias.get(product)
+        if not alt:
+            return None
+        value = fps.get(alt)
+        return int(value) if isinstance(value, (int, float)) else None
+
+    def _aggressive_rebalance(self, orderbook: OrderBook, fps: dict, my_positions: dict) -> None:
+        now = time.time()
+        if (now - self.last_aggressive) < self.AGGRESSIVE_COOLDOWN_SECONDS:
+            return
+
+        product = orderbook.product
+        fair = self._fair_for_product(product, fps)
+        if fair is None:
+            return
+        position = int(my_positions.get(product, 0))
+
+        if position >= self.AGGRESSIVE_TRIGGER and orderbook.buy_orders:
+            best_bid = orderbook.buy_orders[0]
+            vol = min(
+                position - self.AGGRESSIVE_TRIGGER,
+                self.AGGRESSIVE_MAX_VOL,
+                int(best_bid.volume),
+            )
+            if vol > 0:
+                order = OrderRequest(product=product, price=round(best_bid.price), volume=vol, side=Side.SELL)
+                self.send_order(order)
+                self.last_aggressive = now
+                self.log(
+                    f"Aggressive reduce SELL {product}: px={round(best_bid.price)} vol={vol} "
+                    f"pos={position} fair={fair}"
+                )
+
+        elif position <= -self.AGGRESSIVE_TRIGGER and orderbook.sell_orders:
+            best_ask = orderbook.sell_orders[0]
+            vol = min(
+                (-self.AGGRESSIVE_TRIGGER) - position,
+                self.AGGRESSIVE_MAX_VOL,
+                int(best_ask.volume),
+            )
+            if vol > 0:
+                order = OrderRequest(product=product, price=round(best_ask.price), volume=vol, side=Side.BUY)
+                self.send_order(order)
+                self.last_aggressive = now
+                self.log(
+                    f"Aggressive reduce BUY {product}: px={round(best_ask.price)} vol={vol} "
+                    f"pos={position} fair={fair}"
+                )
+
+    def request_positions(self):
+        return self.get_positions()
+
+    def request_all_orders(self):
+        return self.get_orders()
+
+    def _compute_pending_exposure(self, open_orders: list[dict]) -> dict[str, tuple[int, int]]:
+        exposure: dict[str, list[int]] = {}
+        for o in open_orders:
+            product = str(o.get("product", ""))
+            side = str(o.get("side", ""))
+            volume = int(o.get("volume", 0))
+            filled = int(o.get("filled", 0))
+            remaining = max(volume - filled, 0)
+            if not product or remaining <= 0:
+                continue
+            if product not in exposure:
+                exposure[product] = [0, 0]  # buy_pending, sell_pending
+            if side.upper() == "BUY":
+                exposure[product][0] += remaining
+            elif side.upper() == "SELL":
+                exposure[product][1] += remaining
+        return {k: (v[0], v[1]) for k, v in exposure.items()}
+
+    def order(self, product, fair_price, position, s, normal_vol=20, pending_buy=0, pending_sell=0):
+        effective_pos = position + pending_buy - pending_sell
+        self.log(
+            f"Order plan {product}: fair={round(fair_price)} pos={position} pending=+{pending_buy}/-{pending_sell} "
+            f"effective_pos={effective_pos} spread={s} normal_vol={normal_vol}"
+        )
+        if effective_pos > 0:
             # sell @ s + 
-            sell_price = fair_price + s * (self.LIMIT - position)/self.LIMIT
-            vol = position
+            sell_price = fair_price + s * (self.LIMIT - effective_pos) / self.LIMIT
+            vol = min(effective_pos, normal_vol)
             order_sell = OrderRequest(product=product,
                                    price=round(sell_price),
                                    volume=vol,
                                    side=Side.SELL)
+            self.log(f"Send reduce SELL {product}: px={round(sell_price)} vol={vol}")
+            self.send_order(order_sell)
             # print(f"Send {}")
-        if position < 0:
-            buy_price = fair_price - s * (self.LIMIT + position)/self.LIMIT
-            vol = -position
+        if effective_pos < 0:
+            buy_price = fair_price - s * (self.LIMIT + effective_pos) / self.LIMIT
+            vol = min(-effective_pos, normal_vol)
             order_buy = OrderRequest(product=product,
                                    price=round(buy_price),
                                    volume=vol,
                                    side=Side.BUY)
+            self.log(f"Send reduce BUY {product}: px={round(buy_price)} vol={vol}")
             self.send_order(order_buy)
         
-        vol = min([200 - position, normal_vol])
+        vol = min([max(self.LIMIT - effective_pos, 0), normal_vol])
         if vol > 0:
             order_buy_normal = OrderRequest(product=product,
                                     price=round(fair_price - s),
                                     volume=vol,
                                     side=Side.BUY)
+            self.log(f"Send normal BUY {product}: px={round(fair_price - s)} vol={vol}")
             self.send_order(order_buy_normal)
-        vol = min([200 + position, normal_vol])
+        vol = min([max(self.LIMIT + effective_pos, 0), normal_vol])
         if vol > 0:
             order_sell_normal = OrderRequest(product=product,
                                     price=round(fair_price + s),
                                     volume=vol,
                                     side=Side.SELL)
+            self.log(f"Send normal SELL {product}: px={round(fair_price + s)} vol={vol}")
             self.send_order(order_sell_normal)
 
     def on_orderbook(self, orderbook: OrderBook):
         self.seen_products.add(orderbook.product)
+        self.log(f"on_orderbook event: product={orderbook.product}")
+        try:
+            with open("fps.json", "r", encoding="utf-8") as f:
+                fps_live = json.load(f)
+            my_positions_live = self.request_positions()
+            self._aggressive_rebalance(orderbook, fps_live, my_positions_live)
+        except Exception:
+            pass
         # print(orderbook)的
         if time.time()-self.last > 30:
             self.last = time.time()
-            print("Receiving Orderbook, Canceling orders")
-            # self.cancel_all_orders()
-            print("Load Fairprice")
-            with open("fps.json", "r", encoding="utf-8") as f:
-                fps = json.load(f)
+            self.log(f"Orderbook tick: product={orderbook.product}")
+            self.log("Receiving Orderbook, Canceling orders")
+            open_orders = self.request_all_orders()
+            self.pending_exposure = self._compute_pending_exposure(open_orders)
+            self.log(f"Open orders snapshot: {len(open_orders)}")
+            for p, (pb, ps) in sorted(self.pending_exposure.items()):
+                self.log(f"Pending exposure {p}: buy={pb} sell={ps}")
+            self.log("Load Fairprice from fps.json (fallback: fps_est.json)")
+            fps = None
+            source_file = ""
+            try:
+                with open("fps.json", "r", encoding="utf-8") as f:
+                    fps = json.load(f)
+                    source_file = "fps.json"
+            except Exception as exc:
+                self.log(f"Failed to read fps.json: {exc}")
+                try:
+                    with open("fps_est.json", "r", encoding="utf-8") as f:
+                        fps = json.load(f)
+                        source_file = "fps_est.json"
+                except Exception as backup_exc:
+                    self.log(f"Failed to read fps_est.json: {backup_exc}")
+                    return
+            self.log(f"Fairprice source: {source_file}")
+            self.log(
+                "Loaded fair prices: "
+                f"{', '.join(sorted(k for k in fps.keys() if k in {'WX_SPOT','WX_SUM','TIDE_SPOT','TIDE_SWING','LHR_COUNT','LHR_INDEX','LON_ETF','LON_FLY','3_Weather','4_Weather','1_Tide','2_Tide','5_Flights','6_Airport','7_ETF','8_Option'}))}"
+            )
             my_positions = self.request_positions()
+            self.log(f"Positions snapshot: {my_positions}")
             self.strategy_weather(my_positions, fps)
             self.strategy_flight(my_positions, fps)
             self.strategy_tide_and_derived(my_positions, fps)
+        else:
+            self.log("Skip strategy run: waiting for 30s throttle window")
         
         # print(self.request_positions())
         # do_i_want_to_buy = False
@@ -137,7 +300,9 @@ try:
     # print(bot.request_positions())
 
     # print(bot.request_all_orders())
+    bot.log("Starting bot")
     bot.start()
+    bot.log("Bot started")
 
     while True:
         pass

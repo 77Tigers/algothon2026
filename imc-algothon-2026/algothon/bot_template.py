@@ -13,7 +13,6 @@ from functools import cached_property
 from threading import Thread
 from traceback import format_exc
 from typing import Any, Callable, Literal
-from json import JSONDecodeError
 
 import requests
 import sseclient
@@ -140,15 +139,9 @@ class _SSEThread(Thread):
     def close(self):
         self._closed = True
         if self._http_stream:
-            try:
-                self._http_stream.close()
-            except Exception:
-                pass
+            self._http_stream.close()
         if self._client:
-            try:
-                self._client.close()
-            except (AttributeError, Exception):
-                pass
+            self._client.close()
 
     def _consume(self):
         headers = {
@@ -156,32 +149,13 @@ class _SSEThread(Thread):
             "Accept": "text/event-stream; charset=utf-8",
         }
         self._http_stream = requests.get(self._url, stream=True, headers=headers, timeout=30)
-        try:
-            # sseclient-py style: accepts an already-open requests Response stream.
-            self._client = sseclient.SSEClient(self._http_stream)
-            event_iter = self._client.events() if hasattr(self._client, "events") else self._client
-        except requests.exceptions.InvalidURL:
-            # sseclient style: expects URL + request kwargs, not a Response object.
-            self._http_stream.close()
-            self._http_stream = None
-            self._client = sseclient.SSEClient(self._url, headers=headers, timeout=30)
-            event_iter = self._client.events() if hasattr(self._client, "events") else self._client
+        self._client = sseclient.SSEClient(self._http_stream)
 
-        for event in event_iter:
-            raw_data = (event.data or "").strip()
-            if not raw_data:
-                continue
+        for event in self._client.events():
             if event.event == "order":
-                try:
-                    payload = json.loads(raw_data)
-                except JSONDecodeError:
-                    continue
-                self._on_order_event(payload)
+                self._on_order_event(json.loads(event.data))
             elif event.event == "trade":
-                try:
-                    data = json.loads(raw_data)
-                except JSONDecodeError:
-                    continue
+                data = json.loads(event.data)
                 trades = data if isinstance(data, list) else [data]
                 trade_fields = {f.name for f in Trade.__dataclass_fields__.values()}
                 for t in trades:

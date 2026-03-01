@@ -56,8 +56,32 @@ def _fetch_flights_range(from_local: str, to_local: str) -> dict:
     params = {
         "direction": "Both",
         "withLeg": "true",
-        "withCancelled": "true",
-        "withCodeshared": "true",
+        "withCancelled": "false",
+        "withCodeshared": "false",
+        "withCargo": "true",
+        "withPrivate": "true",
+        "withLocation": "false",
+    }
+    resp = requests.get(url, params=params, headers=_rapidapi_headers(), timeout=25)
+    resp.raise_for_status()
+    payload = resp.json()
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"Unexpected AeroDataBox payload type: {type(payload).__name__}")
+    if "arrivals" not in payload or "departures" not in payload:
+        msg = payload.get("message") or payload.get("error") or str(payload)[:240]
+        raise RuntimeError(f"Unexpected AeroDataBox payload shape: {msg}")
+    return payload
+
+
+def _fetch_flights_relative(offset_minutes: int, duration_minutes: int) -> dict:
+    url = f"https://{AERODATABOX_HOST}/flights/airports/iata/{AIRPORT}"
+    params = {
+        "offsetMinutes": str(offset_minutes),
+        "durationMinutes": str(duration_minutes),
+        "direction": "Both",
+        "withLeg": "true",
+        "withCancelled": "false",
+        "withCodeshared": "false",
         "withCargo": "true",
         "withPrivate": "true",
         "withLocation": "false",
@@ -99,12 +123,17 @@ def _extract_local_timestamp(flight: dict, direction: str) -> pd.Timestamp | Non
 
 
 def _session_flights_aerodatabox(start: datetime, end: datetime) -> tuple[list[pd.Timestamp], list[pd.Timestamp]]:
-    def collect(windows: list[tuple[datetime, datetime]]) -> tuple[list[pd.Timestamp], list[pd.Timestamp]]:
+    def collect(
+        windows: list[tuple[datetime, datetime, int, int]]
+    ) -> tuple[list[pd.Timestamp], list[pd.Timestamp]]:
         arrivals: list[pd.Timestamp] = []
         departures: list[pd.Timestamp] = []
-        for ws, we in windows:
-            print(f"[Flights] API window {ws.strftime('%Y-%m-%d %H:%M')} -> {we.strftime('%Y-%m-%d %H:%M')} (London)")
-            payload = _fetch_flights_range(ws.strftime("%Y-%m-%dT%H:%M"), we.strftime("%Y-%m-%dT%H:%M"))
+        for ws, we, offset_minutes, duration_minutes in windows:
+            print(
+                f"[Flights] API window {ws.strftime('%Y-%m-%d %H:%M')} -> {we.strftime('%Y-%m-%d %H:%M')} "
+                f"(offset={offset_minutes}m duration={duration_minutes}m)"
+            )
+            payload = _fetch_flights_relative(offset_minutes=offset_minutes, duration_minutes=duration_minutes)
             print(
                 f"[Flights] API raw window counts: arrivals={len(payload.get('arrivals', []))} "
                 f"departures={len(payload.get('departures', []))}"
@@ -119,15 +148,16 @@ def _session_flights_aerodatabox(start: datetime, end: datetime) -> tuple[list[p
                     departures.append(ts)
         return arrivals, departures
 
-    try:
-        arrivals, departures = collect([(start, end)])
-    except requests.HTTPError as exc:
-        status = exc.response.status_code if exc.response is not None else None
-        if status != 400:
-            raise
-        print("[Flights] API 24h window rejected (400), retrying as 2x12h windows")
-        mid = start + timedelta(hours=12)
-        arrivals, departures = collect([(start, mid), (mid, end)])
+    mid = start + timedelta(hours=12)
+    now_local = datetime.now(LONDON_TZ)
+    offset_1 = int(round((start - now_local).total_seconds() / 60))
+    offset_2 = int(round((mid - now_local).total_seconds() / 60))
+    arrivals, departures = collect(
+        [
+            (start, mid, offset_1, 720),
+            (mid, end, offset_2, 720),
+        ]
+    )
 
     print(f"[Flights] API parsed: arrivals={len(arrivals)} departures={len(departures)} total={len(arrivals)+len(departures)}")
     return arrivals, departures

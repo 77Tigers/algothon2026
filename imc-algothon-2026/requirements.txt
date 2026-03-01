@@ -3,6 +3,8 @@ requests
 beautifulsoup4 
 lxml 
 pandas 
+numpy
+scipy
 json5
 sseclient
 

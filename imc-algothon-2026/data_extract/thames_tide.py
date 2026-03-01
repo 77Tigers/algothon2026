@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import time
 from pathlib import Path
+from datetime import datetime, timedelta
 
 import pandas as pd
 import requests
@@ -70,23 +71,61 @@ def get_thames(limit: int = 300, retries: int = 3, cache_file: str = "thames_raw
 def get_thames_fair_price(
     write_output: bool = False,
     output_dir: str = ".",
+    extrapolate_swing: bool = True,
+    swing_lookback_steps: int = 16,
 ) -> tuple[int, int]:
     start, end = settlement_session_bounds()
-    df = get_thames()
-    session = df[(df["time"] >= start) & (df["time"] < end)].copy()
-    if session.empty:
+    now = datetime.now(LONDON_TZ)
+    df = get_thames(limit=500)  # ~5 days of 15-min readings
+    session_full = df[(df["time"] >= start) & (df["time"] < end)].copy()
+    realized_end = min(now, end)
+    session_realized = df[(df["time"] >= start) & (df["time"] < realized_end)].copy()
+    if session_realized.empty:
         raise RuntimeError("No Thames readings in current session window")
 
-    # TIDE_SPOT: absolute tidal level at settlement (12pm) in mm AOD.
-    settle_idx = (df["time"] - end).abs().idxmin()
-    settle_level_m = float(df.loc[settle_idx, "level"])
-    tide_spot = abs(settle_level_m) * 1000.0
+    # TIDE_SPOT: absolute value of water level at settlement time (in mm).
+    # After settlement: use actual reading at settlement time.
+    # Before settlement: average of previous days' 12:00 readings as predictor.
+    if now >= end:
+        spot_idx = (df["time"] - end).abs().idxmin()
+        spot_level_m = float(df.loc[spot_idx, "level"])
+        spot_source = "settlement_12"
+    else:
+        # Find all readings closest to 12:00 on previous days
+        # Take abs() of EACH level first — settlement = abs(level), and
+        # E[|X|] != |E[X]| when levels alternate sign (tidal oscillation).
+        noon_abs_levels = []
+        for day_offset in range(1, 6):  # look back 1-5 days
+            target_noon = end - timedelta(days=day_offset)
+            candidates = df[(df["time"] - target_noon).abs() < timedelta(minutes=15)]
+            if not candidates.empty:
+                idx = (candidates["time"] - target_noon).abs().idxmin()
+                noon_abs_levels.append(abs(float(candidates.loc[idx, "level"])))
+        if noon_abs_levels:
+            spot_level_m = sum(noon_abs_levels) / len(noon_abs_levels)
+            spot_source = f"avg_abs_noon_{len(noon_abs_levels)}d"
+        else:
+            # Fallback: latest reading
+            spot_idx = (df["time"] - now).abs().idxmin()
+            spot_level_m = float(df.loc[spot_idx, "level"])
+            spot_source = "latest_fallback"
+    tide_spot = abs(spot_level_m) * 1000.0
+    print(f"[Tide] TIDE_SPOT={tide_spot:.0f}mm source={spot_source}")
 
-    # TIDE_SWING: sum over 15m diffs in cm of strangle payoff with strikes 20/25.
-    diffs_cm = session["level"].diff().abs().dropna() * 100.0
-    put_leg = (20.0 - diffs_cm).clip(lower=0.0)
-    call_leg = (diffs_cm - 25.0).clip(lower=0.0)
-    tide_swing = (put_leg + call_leg).sum()
+    # TIDE_SWING: realized part + extrapolated remainder (optional).
+    realized_diffs_cm = session_realized["level"].diff().abs().dropna() * 100.0
+    realized_payoff = (20.0 - realized_diffs_cm).clip(lower=0.0) + (realized_diffs_cm - 25.0).clip(lower=0.0)
+    realized_swing = float(realized_payoff.sum())
+
+    remaining_steps = max(int((end - realized_end).total_seconds() // (15 * 60)), 0)
+    extrapolated_swing = 0.0
+    avg_step_payoff = 0.0
+    if extrapolate_swing and remaining_steps > 0 and len(realized_payoff) > 0:
+        recent = realized_payoff.tail(max(1, swing_lookback_steps))
+        avg_step_payoff = float(recent.mean())
+        extrapolated_swing = avg_step_payoff * remaining_steps
+
+    tide_swing = realized_swing + extrapolated_swing
 
     tide_spot_rounded = round(tide_spot)
     tide_swing_rounded = round(tide_swing)
@@ -96,15 +135,24 @@ def get_thames_fair_price(
         out_dir.mkdir(parents=True, exist_ok=True)
         # Full raw series and session slice for quick debugging / audit.
         df.to_csv(out_dir / "thames_raw_latest.csv", index=False)
-        session.to_csv(out_dir / "thames_session_latest.csv", index=False)
+        session_full.to_csv(out_dir / "thames_session_latest.csv", index=False)
         payload = {
+            "calculated_at": now.isoformat(),
             "session_start": start.isoformat(),
             "session_end": end.isoformat(),
-            "settlement_level_mAOD": settle_level_m,
+            "session_realized_end": realized_end.isoformat(),
+            "is_finalized": bool(now >= end),
+            "spot_level_mAOD": spot_level_m,
+            "spot_source": spot_source,
             "tide_spot_mm": tide_spot,
             "tide_spot_rounded": tide_spot_rounded,
-            "num_session_readings": int(len(session)),
-            "num_swing_diffs": int(len(diffs_cm)),
+            "num_session_readings": int(len(session_full)),
+            "num_realized_readings": int(len(session_realized)),
+            "num_realized_swing_diffs": int(len(realized_diffs_cm)),
+            "remaining_15m_steps": int(remaining_steps),
+            "swing_avg_step_payoff": float(avg_step_payoff),
+            "swing_realized": float(realized_swing),
+            "swing_extrapolated": float(extrapolated_swing),
             "tide_swing": float(tide_swing),
             "tide_swing_rounded": tide_swing_rounded,
         }
