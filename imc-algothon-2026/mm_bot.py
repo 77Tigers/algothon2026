@@ -167,8 +167,8 @@ def position_sizing_calculation(current_position, position_limit, max_post_volum
 
     # Soft limit: scale down volume early to prevent large accumulation
     abs_pos = abs(current_position)
-    soft_limit = position_limit * 0.4
-    hard_limit = position_limit * 0.7
+    soft_limit = position_limit * 0.6
+    hard_limit = position_limit * 0.9
     adding_to_position = (side == "bid" and current_position > 0) or \
                          (side == "ask" and current_position < 0)
 
@@ -374,21 +374,21 @@ PRODUCT_PARAMS = {
     # LHR_COUNT: monotonic accumulation, medium vol
     # LON_ETF/FLY: composite, highest vol
     # fair_anchor_weight: WX=high (stable API), Flight=medium (API delay), Tide=lower (extrapolation), ETF/FLY=derived
-    "TIDE_SPOT":  {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.5, "fair_anchor_weight": 0.3, "max_post_volume": 10},
+    "TIDE_SPOT":  {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.5, "fair_anchor_weight": 0.2, "max_post_volume": 10},
     "TIDE_SWING": {"base_spread_pct": 0.01, "inventory_risk_pct": 0.015, "volatility_pct": 0.8, "fair_anchor_weight": 0.3, "max_post_volume": 8},
     "WX_SPOT":    {"base_spread_pct": 0.005, "inventory_risk_pct": 0.008, "volatility_pct": 0.2, "fair_anchor_weight": 0.0, "max_post_volume": 10},
     "WX_SUM":     {"base_spread_pct": 0.005, "inventory_risk_pct": 0.008, "volatility_pct": 0.2, "fair_anchor_weight": 0.0, "max_post_volume": 10},
-    "LHR_COUNT":  {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.3, "fair_anchor_weight": 0.3, "max_post_volume": 10},
-    "LHR_INDEX":  {"base_spread_pct": 0.03, "inventory_risk_pct": 0.03, "volatility_pct": 0.5, "fair_anchor_weight": 0.3, "max_post_volume": 8},
+    "LHR_COUNT":  {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.3, "fair_anchor_weight": 0.1, "max_post_volume": 10},
+    "LHR_INDEX":  {"base_spread_pct": 0.03, "inventory_risk_pct": 0.03, "volatility_pct": 0.5, "fair_anchor_weight": 0.0, "max_post_volume": 8},
     "LON_ETF":    {"base_spread_pct": 0.001, "inventory_risk_pct": 0.005, "volatility_pct": 0.5, "fair_anchor_weight": 0.1, "max_post_volume": 5},
     "LON_FLY":    {"base_spread_pct": 0.005, "inventory_risk_pct": 0.005, "volatility_pct": 1.0, "fair_anchor_weight": 0.1, "max_post_volume": 3},
     # Also support numbered symbols
-    "1_Tide":     {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.5, "fair_anchor_weight": 0.3, "max_post_volume": 10},
+    "1_Tide":     {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.5, "fair_anchor_weight": 0.2, "max_post_volume": 10},
     "2_Tide":     {"base_spread_pct": 0.01, "inventory_risk_pct": 0.015, "volatility_pct": 0.8, "fair_anchor_weight": 0.3, "max_post_volume": 8},
     "3_Weather":  {"base_spread_pct": 0.005, "inventory_risk_pct": 0.008, "volatility_pct": 0.2, "fair_anchor_weight": 0.0, "max_post_volume": 10},
     "4_Weather":  {"base_spread_pct": 0.005, "inventory_risk_pct": 0.008, "volatility_pct": 0.2, "fair_anchor_weight": 0.0, "max_post_volume": 10},
-    "5_Flights":  {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.3, "fair_anchor_weight": 0.3, "max_post_volume": 10},
-    "6_Airport":  {"base_spread_pct": 0.03, "inventory_risk_pct": 0.03, "volatility_pct": 0.5, "fair_anchor_weight": 0.3, "max_post_volume": 8},
+    "5_Flights":  {"base_spread_pct": 0.003, "inventory_risk_pct": 0.008, "volatility_pct": 0.3, "fair_anchor_weight": 0.1, "max_post_volume": 10},
+    "6_Airport":  {"base_spread_pct": 0.03, "inventory_risk_pct": 0.03, "volatility_pct": 0.5, "fair_anchor_weight": 0.0, "max_post_volume": 8},
     "7_ETF":      {"base_spread_pct": 0.001, "inventory_risk_pct": 0.005, "volatility_pct": 0.5, "fair_anchor_weight": 0.1, "max_post_volume": 5},
     "8_Option":   {"base_spread_pct": 0.005, "inventory_risk_pct": 0.005, "volatility_pct": 1.0, "fair_anchor_weight": 0.1, "max_post_volume": 3},
 }
@@ -421,7 +421,7 @@ class MMBot(BaseBot):
     """
 
     # Products to skip (no quoting). Use canonical or numbered names.
-    SKIP_PRODUCTS: set[str] = {"LON_FLY", "8_Option"}
+    SKIP_PRODUCTS: set[str] = {"LON_FLY", "8_Option", "LON_ETF", "7_ETF", "WX_SUM", "4_Weather", "LHR_INDEX", "6_Airport", "TIDE_SWING", "2_Tide"}
 
     def __init__(self, cmi_url: str, username: str, password: str,
                  params: dict | None = None, quote_interval: float = 5.0,
